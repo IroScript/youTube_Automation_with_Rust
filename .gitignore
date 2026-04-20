@@ -1,0 +1,27 @@
+# Rust
+/target/
+Cargo.lock
+
+# Database
+pipeline.db
+pipeline.db-shm
+pipeline.db-wal
+
+# Videos
+videos/*.mp4
+
+# Logs
+logs/*.log
+
+# Config (contains API keys)
+config/api_keys.toml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
