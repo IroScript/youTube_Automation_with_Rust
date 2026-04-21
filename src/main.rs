@@ -67,37 +67,43 @@ fn init_db() -> Result<Connection, rusqlite::Error> {
 }
 
 // ==========================================
-// 3. PROMPT GENERATOR (AI)
+// 3. PROMPT GENERATOR (Groq API)
 // ==========================================
 async fn generate_prompt(api_key: &str, idea: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     info!("🔄 [PROMPT] Starting prompt generation for idea: '{}'", idea);
     
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={}",
-        api_key
-    );
+    let url = "https://api.groq.com/openai/v1/chat/completions";
 
-    info!("🔄 [PROMPT] Sending request to Gemini API...");
+    info!("🔄 [PROMPT] Sending request to Groq API...");
     let client = reqwest::Client::new();
     let payload = serde_json::json!({
-        "contents": [{
-            "parts": [{
-                "text": format!("Create a detailed video generation prompt for Veo 3.1 about: {}. The prompt should be 1-2 sentences, cinematic, 8 seconds long. Only return the prompt.", idea)
-            }]
-        }]
+        "model": "llama-3.3-70b-versatile",
+        "messages": [{
+            "role": "user",
+            "content": format!("Create a detailed video generation prompt for Veo 3.1 about: {}. The prompt should be 1-2 sentences, cinematic, 8 seconds long. Only return the prompt, nothing else.", idea)
+        }],
+        "temperature": 0.7,
+        "max_tokens": 200
     });
 
     debug!("🔄 [PROMPT] Request payload: {}", serde_json::to_string_pretty(&payload).unwrap_or_default());
 
-    let res = client.post(&url).json(&payload).send().await?;
-    info!("✅ [PROMPT] Received response from Gemini API (Status: {})", res.status());
+    let res = client
+        .post(url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await?;
+    
+    info!("✅ [PROMPT] Received response from Groq API (Status: {})", res.status());
     
     let json: serde_json::Value = res.json().await?;
     debug!("🔄 [PROMPT] Response JSON: {}", serde_json::to_string_pretty(&json).unwrap_or_default());
 
-    let prompt = json["candidates"][0]["content"]["parts"][0]["text"]
+    let prompt = json["choices"][0]["message"]["content"]
         .as_str()
-        .ok_or("Failed to parse prompt from AI response")?
+        .ok_or("Failed to parse prompt from Groq response")?
         .to_string();
 
     info!("✅ [PROMPT] Successfully generated prompt: '{}'", prompt);
@@ -105,7 +111,7 @@ async fn generate_prompt(api_key: &str, idea: &str) -> Result<String, Box<dyn st
 }
 
 // ==========================================
-// 4. VIDEO GENERATOR (Veo Fallback)
+// 4. VIDEO GENERATOR (Veo 3.1 via RapidAPI)
 // ==========================================
 async fn generate_video_with_fallback(
     client: &reqwest::Client,
@@ -115,8 +121,8 @@ async fn generate_video_with_fallback(
     info!("🔄 [VEO] Starting video generation with {} API keys available", api_keys.len());
     info!("🔄 [VEO] Prompt to use: '{}'", prompt);
     
-    // Replace with your actual Veo 3.1 endpoint
-    let veo_url = "https://us-central1-aiplatform.googleapis.com/v1/projects/YOUR_PROJECT/locations/us-central1/publishers/google/models/veo-3.1:predict";
+    // RapidAPI Veo 3.1 endpoint
+    let veo_url = "https://google-veo-3-1-text-to-video-api.p.rapidapi.com/generate";
 
     for (index, key) in api_keys.iter().enumerate() {
         let key_num = index + 1;
@@ -124,8 +130,8 @@ async fn generate_video_with_fallback(
         info!("🔄 [VEO] Key #{}: Preparing request payload...", key_num);
         
         let payload = serde_json::json!({
-            "instances": [{ "prompt": prompt, "duration": 8, "resolution": "1080p" }],
-            "parameters": { "sampleCount": 1 }
+            "prompt": prompt,
+            "aspectRatio": "16:9"
         });
 
         debug!("🔄 [VEO] Key #{}: Request payload: {}", key_num, serde_json::to_string_pretty(&payload).unwrap_or_default());
@@ -133,7 +139,9 @@ async fn generate_video_with_fallback(
 
         let res = client
             .post(veo_url)
-            .header("Authorization", format!("Bearer {}", key))
+            .header("Content-Type", "application/json")
+            .header("x-rapidapi-host", "google-veo-3-1-text-to-video-api.p.rapidapi.com")
+            .header("x-rapidapi-key", key)
             .json(&payload)
             .timeout(std::time::Duration::from_secs(90))
             .send()
@@ -145,10 +153,30 @@ async fn generate_video_with_fallback(
                 let json: serde_json::Value = response.json().await?;
                 debug!("🔄 [VEO] Key #{}: Response JSON: {}", key_num, serde_json::to_string_pretty(&json).unwrap_or_default());
                 
-                if let Some(video_url) = json["predictions"][0]["video_url"].as_str() {
+                // Check for video URL in response
+                if let Some(video_url) = json["data"]["videoUrl"].as_str() {
                     info!("✅ [VEO] Key #{}: Video URL extracted: {}", key_num, video_url);
                     info!("🎉 [VEO] Video generation completed successfully with Key #{}", key_num);
                     return Ok(video_url.to_string());
+                } else if let Some(video_url) = json["videoUrl"].as_str() {
+                    info!("✅ [VEO] Key #{}: Video URL extracted: {}", key_num, video_url);
+                    info!("🎉 [VEO] Video generation completed successfully with Key #{}", key_num);
+                    return Ok(video_url.to_string());
+                } else if let Some(task_id) = json["data"]["taskId"].as_str() {
+                    // Need to poll for status
+                    info!("🔄 [VEO] Key #{}: Got task ID: {}. Polling for status...", key_num, task_id);
+                    match poll_video_status(client, key, task_id).await {
+                        Ok(url) => {
+                            info!("🎉 [VEO] Video generation completed successfully with Key #{}", key_num);
+                            return Ok(url);
+                        }
+                        Err(e) => {
+                            warn!("❌ [VEO] Key #{}: Polling failed: {}", key_num, e);
+                            if key_num < api_keys.len() {
+                                info!("🔄 [VEO] Key #{}: Moving to next API key...", key_num);
+                            }
+                        }
+                    }
                 } else {
                     warn!("⚠️ [VEO] Key #{}: Response successful but no video_url found in JSON", key_num);
                     warn!("⚠️ [VEO] Key #{}: Skipping to next key...", key_num);
@@ -175,6 +203,46 @@ async fn generate_video_with_fallback(
 
     error!("❌ [VEO] All {} API keys exhausted. Video generation failed.", api_keys.len());
     Err("All Veo API keys failed or exhausted.".into())
+}
+
+// Poll for video status
+async fn poll_video_status(
+    client: &reqwest::Client,
+    api_key: &str,
+    task_id: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let status_url = format!(
+        "https://google-veo-3-1-text-to-video-api.p.rapidapi.com/status/{}",
+        task_id
+    );
+    
+    // Poll for up to 2 minutes
+    for _ in 0..24 {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        
+        let res = client
+            .get(&status_url)
+            .header("x-rapidapi-host", "google-veo-3-1-text-to-video-api.p.rapidapi.com")
+            .header("x-rapidapi-key", api_key)
+            .send()
+            .await?;
+        
+        if res.status().is_success() {
+            let json: serde_json::Value = res.json().await?;
+            
+            if let Some(status) = json["data"]["status"].as_str() {
+                if status == "completed" {
+                    if let Some(video_url) = json["data"]["videoUrl"].as_str() {
+                        return Ok(video_url.to_string());
+                    }
+                } else if status == "failed" {
+                    return Err("Video generation failed".into());
+                }
+            }
+        }
+    }
+    
+    Err("Video generation timeout".into())
 }
 
 // ==========================================
